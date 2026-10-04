@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.4.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -260,6 +260,40 @@ def enable_recipe(recipe_id: int):
         return store.set_recipe_status(recipe_id, "active")
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+class RestoreIn(BaseModel):
+    # 选定的历史版本（要恢复成哪一版的名称与参数）
+    version: int = Field(ge=1)
+    # 查看历史时该配方的当前版本；恢复提交时必须仍等于当前版本
+    current_version: int = Field(alias="currentVersion", ge=1)
+
+    model_config = {"populate_by_name": True}
+
+
+@app.get("/api/recipes/{recipe_id}/versions")
+def get_recipe_versions(recipe_id: int):
+    # 按 version 升序列出参数历史（版本、名称与全部材料参数）；
+    # 配方不存在返回 404。纯只读，不补写、不修改任何数据。
+    try:
+        return store.list_recipe_history(recipe_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.post("/api/recipes/{recipe_id}/restore")
+def restore_recipe(recipe_id: int, payload: RestoreIn):
+    # 恢复旧版：复制旧版名称与全部材料参数成为新版本（version +1），
+    # 保持当前可用状态，并在同一事务里按原规则重算全部活动引用草稿。
+    # 携带目标历史 version 与查看时的当前 version：当前已变化 => 409
+    # （不重试、不覆盖他次修改）；配方或历史版本不存在 => 404。
+    try:
+        recipe, drafts = store.restore_recipe_version(
+            recipe_id, payload.version, payload.current_version
+        )
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+    return {"recipe": recipe, "recomputedDrafts": drafts}
 
 
 # ---------------- 炉次草稿 ----------------

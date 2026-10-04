@@ -124,6 +124,34 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
   幂等返回 200）。状态切换**不改变材料参数、不增加配方或草稿版本、
   不重算任何炉次**；停用的配方仍可整份修改（保持停用），原有引用草稿
   照常重算与归档，已归档方案不受影响。恢复后可再次被新炉次引用。
+- **参数历史与回看**：每个成功的「整份参数落库」都追加一版历史——
+  创建配方记**版本 1**，此后每次成功的整份修改（PUT）与每次成功的
+  **历史版本恢复**都各追加一版；**停用 / 恢复可用状态不记参数历史**。
+  `GET /api/recipes/{id}/versions` 按 **version 升序**返回每一版的
+  `version`、`name` 与全部材料参数（`holdLow` / `holdHigh` /
+  `duration` / `tolerance`），配方不存在返回 404。历史随配方一起保存在
+  SQLite（同库新表 `recipe_history`），跟随现有 Compose 命名卷跨重启
+  保留。**旧数据库升级**时只为每个既有配方补记其**当前 version**
+  一行（名称与参数照抄当前行），重复启动不会重复补记；升级后新建的
+  配方从版本 1 正常记起。
+- **恢复历史版本**：`POST /api/recipes/{id}/restore`，请求体
+  `{"version": 目标历史版本, "currentVersion": 查看历史时的当前版本}`。
+  - 当前配方已变化（`currentVersion` 与服务端当前版本不一致，包括恢复
+    求解期间他次修改 / 另一次恢复先提交）→ **409**，响应体附
+    `currentVersion`，**服务端不重试、不会覆盖他次修改**；请重新读取
+    配方与历史后再恢复。
+  - 配方不存在、或目标历史版本不存在 → **404**。
+  - 成功（200）：复制旧版的**名称与全部材料参数**成为新版本，配方
+    **当前 version +1**（恢复到的内容成为最新一版，历史中同时保留原
+    版本与新版本），并**保持当前可用状态不变**（停用中配方恢复后仍
+    停用）；同时按普通修改的同一规则在**同一事务**里重算所有引用该
+    配方的**活动**草稿（版本各 +1），**已归档炉次不改**。响应结构与
+    PUT 一致：`{"recipe": ..., "recomputedDrafts": [...]}`。
+  - **读取不等待求解**：恢复的耗时重算期间只持有写操作互斥锁、不持
+    读锁，`GET /api/recipes`、`GET /api/drafts`、
+    `GET /api/drafts/{id}` 仍立即返回**上一整次已提交的完整状态**。
+  - **要么全成要么全不生效**：历史追加、配方更新与全部草稿重算在同
+    一条事务里一起 COMMIT；求解异常或写库异常时三者一起回滚。
 
 ### 炉次草稿 `/api/drafts`
 
@@ -263,6 +291,8 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | PUT | `/api/recipes/{id}` | 整份修改配方；原子重算引用它的活动草稿（版本 +1）；停用配方也可修改并保持停用 |
 | POST | `/api/recipes/{id}/disable` | 停用配方（200；未知 404；不改参数/版本，不重算草稿） |
 | POST | `/api/recipes/{id}/enable` | 恢复配方为可用（200；未知 404） |
+| GET | `/api/recipes/{id}/versions` | 按 version 升序列出参数历史（版本、名称与全部材料参数；配方未知 404） |
+| POST | `/api/recipes/{id}/restore` | 恢复历史版本为当前配方（当前版本 +1，保持可用状态，原子重算活动草稿；携带 `version` + `currentVersion`；当前已变化 409 附 `currentVersion`，配方/历史版本不存在 404） |
 | GET | `/api/drafts` | 列出全部炉次（含状态/参数/版本/结果或无解原因） |
 | POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201；引用已停用配方 422） |
 | GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
@@ -514,6 +544,86 @@ curl -sS -X POST http://localhost:8000/api/recipes/999/disable
 
 停用不改变已有炉次：引用它的活动草稿在配方修改时照常重算、可正常归档，
 已归档方案保持冻结；停用的配方本身也仍可整份修改（PUT）并保持停用。
+
+### 回看参数历史与恢复旧版（可直接复制执行）
+
+沿用上面的两个配方与炉次 1（当前配方 1 已被改到版本 2、`holdLow:70`，
+炉次草稿随之到版本 2）。
+
+```bash
+# 1) 按 version 升序回看配方 1 的全部历史（版本、名称与全部材料参数）
+curl -sS http://localhost:8000/api/recipes/1/versions
+```
+
+```json
+[
+  {"version": 1, "name": "钢甲", "holdLow": 60, "holdHigh": 100, "duration": 10, "tolerance": 150},
+  {"version": 2, "name": "钢甲", "holdLow": 70, "holdHigh": 100, "duration": 10, "tolerance": 150}
+]
+```
+
+```bash
+# 2) 恢复到历史版本 1：currentVersion 携带查看时的当前版本（2）
+curl -sS -X POST http://localhost:8000/api/recipes/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"currentVersion":2}'
+```
+
+返回（HTTP 200，节选）：旧版名称与参数成为**新版本 3**，保持可用状态；
+引用它的活动草稿在同一事务里按原规则重算（版本 +1），已归档炉次不改：
+
+```json
+{
+  "recipe": { "id": 1, "name": "钢甲", "holdLow": 60, "holdHigh": 100,
+              "duration": 10, "tolerance": 150, "status": "active", "version": 3 },
+  "recomputedDrafts": [
+    { "id": 1, "status": "active", "version": 3,
+      "materials": [ { "name": "钢甲", "holdLow": 60, "...": "..." } ],
+      "result": { "...": "与 materials 同版的完整结果" } }
+  ]
+}
+```
+
+再次回看可以看到历史随每次成功整份修改 / 恢复追加（停用与恢复可用状态
+不追加）；恢复期间历史行原样保留，新版本只是把旧版内容复制为最新一版：
+
+```bash
+curl -sS http://localhost:8000/api/recipes/1/versions
+# [{"version":1,...,"holdLow":60},{"version":2,...,"holdLow":70},
+#  {"version":3,"name":"钢甲","holdLow":60,...}]
+```
+
+冲突与不存在（可直接复制执行）：
+
+```bash
+# 期间配方又被改过（当前已到 v4），仍带着查看时的 currentVersion=3 恢复 -> 409
+curl -sS -i -X POST http://localhost:8000/api/recipes/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"currentVersion":3}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"恢复期间配方已被他次修改：你查看的是版本 3，当前为版本 4，请重新读取后再恢复。",
+#            "currentVersion":4}}
+# 服务端不会重试、不会用恢复结果覆盖那笔已提交的新修改；重新 GET 历史、
+# 改用新的 currentVersion 后再提交即可。
+
+# 目标历史版本不存在 -> 404
+curl -sS -i -X POST http://localhost:8000/api/recipes/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version":99,"currentVersion":4}'
+# HTTP/1.1 404 Not Found
+# {"detail":"配方 1 不存在历史版本 99。"}
+
+# 配方不存在 -> 404（回看与恢复一致）
+curl -sS -i http://localhost:8000/api/recipes/999/versions
+# HTTP/1.1 404 Not Found
+# {"detail":"配方 999 不存在。"}
+```
+
+停用中的配方也可恢复旧版参数：成功后**版本 +1 但仍为 `disabled`**，
+不影响其停用语义（仍不可被新炉次引用，重新 enable 后才可用）。恢复的
+重算求解期间，`GET /api/recipes`、`GET /api/drafts` 照常立即返回上一整次
+已提交的完整状态，不等待求解；求解或写库异常时历史、配方与草稿整体
+回滚，全部不生效。
 
 ### 归档：携带所查看的版本
 
@@ -786,8 +896,8 @@ content-disposition: attachment; filename="draft-1-v1-sheet.html";
 │   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
 │   ├── exports.py     # 已归档炉次单份离线 HTML 工艺单渲染（纯归档快照，样式内嵌）
-│   ├── db.py          # SQLite 连接、建表、全局读锁与写操作互斥锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 归档曲线只读 / 复用检查 / 工艺单快照 的事务化读写
+│   ├── db.py          # SQLite 连接、建表（含配方参数历史 recipe_history、旧库迁移补记）、全局读锁与写操作互斥锁
+│   └── store.py       # 配方 / 参数历史回看与旧版恢复 / 炉次草稿 / 归档 / 归档曲线只读 / 复用检查 / 工艺单快照 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式

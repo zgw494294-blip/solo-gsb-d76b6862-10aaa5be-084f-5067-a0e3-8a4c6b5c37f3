@@ -62,6 +62,22 @@ CREATE TABLE IF NOT EXISTS recipes (
     updated_at  TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS recipe_history (
+    -- 配方每次「整份参数落库」时的参数历史：创建记版本 1，每次成功
+    -- 整份修改 / 历史版本恢复再追加一行；停用与恢复不记。旧库升级时
+    -- 只为每个既有配方补记其当前版本一行（见 _migrate）。
+    recipe_id   INTEGER NOT NULL,
+    version     INTEGER NOT NULL,
+    name        TEXT    NOT NULL DEFAULT '',
+    hold_low    INTEGER NOT NULL,
+    hold_high   INTEGER NOT NULL,
+    duration    INTEGER NOT NULL,
+    tolerance   INTEGER NOT NULL,
+    created_at  TEXT    NOT NULL,
+    PRIMARY KEY (recipe_id, version),
+    FOREIGN KEY (recipe_id) REFERENCES recipes(id)
+);
+
 CREATE TABLE IF NOT EXISTS drafts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL DEFAULT '',
@@ -98,12 +114,32 @@ def init_db() -> None:
 
 
 def _migrate(conn) -> None:
-    """旧库就地升级：recipes 缺少 status 列时补上，既有配方默认可用。"""
+    """旧库就地升级。
+
+    - recipes 缺少 status 列时补上，既有配方默认可用；
+    - 新增参数历史后，为每个尚无任何历史的既有配方补记**当前版本**
+      一行（名称与全部材料参数照抄当前行）。NOT EXISTS 谓词保证：
+      只补每个旧配方的当前 version 一次，重复启动不会重复补记；升级后
+      新建的配方创建时自带版本 1 历史，同样不会被补记。
+    """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
     if "status" not in cols:
         conn.execute(
             "ALTER TABLE recipes ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
         )
+
+    conn.execute(
+        """INSERT INTO recipe_history
+               (recipe_id, version, name, hold_low, hold_high, duration,
+                tolerance, created_at)
+           SELECT id, version, name, hold_low, hold_high, duration,
+                  tolerance, updated_at
+             FROM recipes r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM recipe_history h
+                 WHERE h.recipe_id = r.id
+            )"""
+    )
 
 
 @contextmanager

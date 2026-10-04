@@ -192,6 +192,14 @@ def create_recipe(
                 (name, hold_low, hold_high, duration, tolerance, now, now),
             )
             rid = cur.lastrowid
+            # 新配方参数历史从版本 1 记起，与配方行同一事务提交
+            conn.execute(
+                """INSERT INTO recipe_history
+                   (recipe_id, version, name, hold_low, hold_high, duration,
+                    tolerance, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (rid, 1, name, hold_low, hold_high, duration, tolerance, now),
+            )
         return get_recipe(rid)
 
 
@@ -300,6 +308,139 @@ def set_recipe_status(recipe_id: int, status: str) -> dict:
                 "UPDATE recipes SET status=? WHERE id=?", (status, recipe_id)
             )
         return get_recipe(recipe_id)
+
+
+# ---------------- 配方参数历史 / 恢复旧版 ----------------
+
+
+def _recipe_history_dict(row) -> dict:
+    return {
+        "version": row["version"],
+        "name": row["name"],
+        "holdLow": row["hold_low"],
+        "holdHigh": row["hold_high"],
+        "duration": row["duration"],
+        "tolerance": row["tolerance"],
+    }
+
+
+def list_recipe_history(recipe_id: int) -> list[dict]:
+    """按 version 升序列出配方的参数历史（版本、名称与全部材料参数）。
+
+    配方不存在 => NotFound（404）。纯只读，不补写、不修改任何数据。
+    """
+    with lock(), connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM recipes WHERE id=?", (recipe_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"配方 {recipe_id} 不存在。")
+        rows = conn.execute(
+            """SELECT version, name, hold_low, hold_high, duration, tolerance
+               FROM recipe_history WHERE recipe_id=? ORDER BY version""",
+            (recipe_id,),
+        ).fetchall()
+        return [_recipe_history_dict(r) for r in rows]
+
+
+def _snapshot_recipe_restore(
+    recipe_id: int, history_version: int, expected_version: int
+) -> dict:
+    """恢复专用快照：在已持全局锁时做 404/409 预检并取重算快照。
+
+    依次判定：配方不存在 => 404；目标历史版本不存在 => 404；当前
+    version 与查看时携带的 expected_version 不一致 => 409（附当前
+    version，不重试）。全部通过则复用整份修改的重算快照结构，并附上
+    目标历史版本的名称与材料参数。
+    """
+    snapshot = _snapshot_recipe_recompute(recipe_id)  # 内部对缺失配方抛 404
+    if snapshot["target"]["version"] != expected_version:
+        raise Conflict(
+            f"配方已被他次修改：你查看的是版本 {expected_version}，"
+            f"当前为版本 {snapshot['target']['version']}，请重新读取后再恢复。",
+            snapshot["target"]["version"],
+        )
+    with connect() as conn:
+        hist = conn.execute(
+            """SELECT version, name, hold_low, hold_high, duration, tolerance
+               FROM recipe_history
+               WHERE recipe_id=? AND version=?""",
+            (recipe_id, history_version),
+        ).fetchone()
+    if hist is None:
+        raise NotFound(
+            f"配方 {recipe_id} 不存在历史版本 {history_version}。"
+        )
+    snapshot["history"] = dict(hist)
+    return snapshot
+
+
+def restore_recipe_version(
+    recipe_id: int, history_version: int, expected_version: int
+) -> tuple[dict, list[dict]]:
+    """把选定历史版本恢复为当前配方（当前 version +1），原子重算活动草稿。
+
+    流程与整份修改的**兜底路径**一致：持写互斥锁走完「权威快照 → 锁外
+    求解 → 单事务复核提交」，全程**只尝试一次**。
+
+    - 写互斥锁只在写操作之间互斥：求解期间**不持全局读锁**，GET
+      /api/recipes、GET /api/drafts、GET /api/drafts/{id} 仍立即读到
+      上一整次已提交的完整状态，不等待本次求解；
+    - 其他写操作（普通修改 / 另一次恢复 / 新建炉次 / 停用恢复 / 归档）
+      在写互斥锁上严格排队，使权威快照、求解与提交之间不可能插入他次
+      写操作——普通修改即使先进入自己的「锁外求解」，也必须等本次恢复
+      出结果后才能提交；因此「普通修改先于恢复提交」时，恢复在权威
+      快照处即看到漂移并直接 **409**，绝不会事后把新修改覆盖回去；
+    - 预检（权威快照时点，读锁内）：配方不存在 / 目标历史版本不存在
+      => **404**；当前 version 与查看时携带的 expected_version 不一致
+      => **409**（附当前版本），**不求解、不写库**；
+    - 求解目标参数为历史版本的名称与全部材料参数（原样复制，包括空名）；
+    - 提交复核仅作防御：持写互斥锁期间不会有漂移；一旦复核不过仍一律
+      **409**，**绝不重新求解、绝不重试**（不使用整份修改的 5 次重试）；
+    - 成功：配方复制旧版名称与参数、version +1、**保持当前可用状态
+      不变**（停用配方恢复后仍停用），新参数作为新版本追加进历史；
+      按原规则重算全部引用它的活动草稿（版本 +1），已归档炉次不改；
+      历史、配方与草稿在同一事务里一起提交，求解或写库异常全部不生效。
+    """
+    with write_lock():
+        # 权威快照（读锁内做 404/409 判定）：之后到本次提交之间不会有
+        # 任何他次写操作插入
+        with lock():
+            snapshot = _snapshot_recipe_restore(
+                recipe_id, history_version, expected_version
+            )
+        hist_row = snapshot["history"]
+
+        # 锁外求解：只持写互斥锁、不持全局读锁，读取照常返回已提交状态
+        prepared = _solve_recompute(
+            snapshot,
+            hist_row["name"],
+            hist_row["hold_low"],
+            hist_row["hold_high"],
+            hist_row["duration"],
+            hist_row["tolerance"],
+        )
+
+        # 仅一次提交尝试：任何漂移都报 409，不重试、不兜底、不覆盖新修改
+        with lock(), connect() as conn:
+            with _tx(conn):
+                affected = _commit_recipe_recompute(conn, recipe_id, prepared)
+            if affected is None:
+                cur = conn.execute(
+                    "SELECT version FROM recipes WHERE id=?", (recipe_id,)
+                ).fetchone()
+                current = cur["version"] if cur is not None else None
+                if current is None:
+                    raise NotFound(f"配方 {recipe_id} 不存在。")
+                raise Conflict(
+                    f"恢复期间配方已被他次修改：你查看的是版本 "
+                    f"{expected_version}，当前为版本 {current}，"
+                    "请重新读取后再恢复。",
+                    current,
+                )
+            recipe = get_recipe(recipe_id)
+            drafts = [get_draft(did) for did in affected]
+        return recipe, drafts
 
 
 def _snapshot_recipe_recompute(recipe_id: int) -> dict:
@@ -452,11 +593,23 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict):
     # 复核通过：配方与全部受影响草稿在同一事务内一起生效
     name, hold_low, hold_high, duration, tolerance = prepared["fields"]
     now = _now()
+    new_version = prepared["base_version"] + 1
     conn.execute(
         """UPDATE recipes SET name=?, hold_low=?, hold_high=?, duration=?,
                tolerance=?, version=version+1, updated_at=?
            WHERE id=?""",
         (name, hold_low, hold_high, duration, tolerance, now, recipe_id),
+    )
+    # 每次成功的整份参数落库（普通修改 / 历史版本恢复）都把新版本的
+    # 名称与全部材料参数追加进历史，与配方、草稿同一事务提交；求解或
+    # 写库异常整体回滚，历史也不会留下半成品版本。
+    conn.execute(
+        """INSERT INTO recipe_history
+           (recipe_id, version, name, hold_low, hold_high, duration,
+            tolerance, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (recipe_id, new_version, name, hold_low, hold_high, duration,
+         tolerance, now),
     )
     for pd in prepared["drafts"]:
         conn.execute(
