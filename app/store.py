@@ -11,7 +11,12 @@
 提交；见 update_recipe 与 create_draft。连续竞争导致复核反复失效时，
 兜底路径持写互斥锁走完 快照→求解→提交 全程：求解仍不持读锁（GET
 不被阻塞），其他写操作在写互斥锁上排队，保证本次写操作必然整体提交
-成功。
+成功。「从历史恢复」（restore_recipe）复用同一两阶段流程但只尝试
+一次：复核不过（他次普通修改先提交等）直接 409，绝不重试覆盖新修改。
+
+参数历史（recipe_versions 表）只追加：创建配方记版本 1，每次成功的
+整份修改（含恢复）在同一事务里追加新版本行；停用 / 恢复可用状态不记
+历史。旧库启动时仅对每个配方补记当前版本，重复启动不重复补记。
 """
 
 from __future__ import annotations
@@ -178,6 +183,37 @@ def get_recipe(recipe_id: int) -> dict:
         return _recipe_dict(row)
 
 
+def _recipe_version_dict(row) -> dict:
+    return {
+        "version": row["version"],
+        "name": row["name"],
+        "holdLow": row["hold_low"],
+        "holdHigh": row["hold_high"],
+        "duration": row["duration"],
+        "tolerance": row["tolerance"],
+    }
+
+
+def list_recipe_versions(recipe_id: int) -> list[dict]:
+    """按 version 升序列出配方的全部历史参数（版本号、名称与全部材料参数）。
+
+    历史只追加：创建记版本 1，每次成功整份修改（含从历史恢复）记新版本；
+    停用 / 恢复可用状态不记历史。配方不存在 => 404。
+    """
+    with lock(), connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM recipes WHERE id=?", (recipe_id,)
+        ).fetchone()
+        if exists is None:
+            raise NotFound(f"配方 {recipe_id} 不存在。")
+        rows = conn.execute(
+            """SELECT * FROM recipe_versions WHERE recipe_id=?
+               ORDER BY version""",
+            (recipe_id,),
+        ).fetchall()
+        return [_recipe_version_dict(r) for r in rows]
+
+
 def create_recipe(
     name: str, hold_low: int, hold_high: int, duration: int, tolerance: int
 ) -> dict:
@@ -192,6 +228,14 @@ def create_recipe(
                 (name, hold_low, hold_high, duration, tolerance, now, now),
             )
             rid = cur.lastrowid
+            # 新配方版本从 1 记起：参数历史与配方在同一事务一起写入
+            conn.execute(
+                """INSERT INTO recipe_versions
+                   (recipe_id, version, name, hold_low, hold_high,
+                    duration, tolerance)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (rid, 1, name, hold_low, hold_high, duration, tolerance),
+            )
         return get_recipe(rid)
 
 
@@ -281,6 +325,63 @@ def update_recipe(
                 # 循环仅为防御，正常只走一遍
 
 
+def restore_recipe(
+    recipe_id: int, target_version: int, current_version: int
+) -> tuple[dict, list[dict]]:
+    """把选定历史版本恢复为当前配方（一次成型，不做任何重试）。
+
+    请求携带目标历史 version（target_version）与查看时的当前 version
+    （current_version）：
+
+    - 配方不存在 => 404；携带的当前版本与现状不一致 => 409（附当前版本）；
+      目标历史版本不存在 => 404；
+    - 成功则**复制旧版的名称与全部材料参数**，配方当前 version +1，**保持
+      当前可用状态**（停用中恢复仍停用），并追加一条新的参数历史；按原
+      规则在同一事务里重算全部活动引用草稿（版本各 +1，无解清除旧曲线），
+      已归档炉次不改。
+
+    与整份修改相同的两阶段提交：锁内取快照（含目标历史行），**锁外**求解
+    全部受影响草稿（求解期间不持锁、不写数据，GET 仍立即读到上一整次已
+    提交的完整状态），再上锁在单条事务里复核并整体提交。但恢复**只有这
+    一次机会**：快照与提交之间若有任何他次写操作生效——包括并发的普通
+    修改先于本次提交（哪怕恢复已经完成求解）——复核即失败，直接返回 409，
+    **绝不重试、绝不覆盖新修改**。求解或写库异常时事务回滚，本次恢复整体
+    不生效（历史、配方、草稿都不留痕）。
+    """
+    # 阶段 1：锁内快照与预检（配方 404 → 当前版本 409 → 历史版本 404）
+    with lock():
+        snapshot = _snapshot_recipe_recompute(recipe_id, target_version)
+    if snapshot["target"]["version"] != current_version:
+        raise Conflict(
+            f"配方已过期：你查看的是版本 {current_version}，"
+            f"当前为版本 {snapshot['target']['version']}，请重新读取后再恢复。",
+            snapshot["target"]["version"],
+        )
+    if snapshot["history"] is None:
+        raise NotFound(f"配方 {recipe_id} 的历史版本 {target_version} 不存在。")
+    history = snapshot["history"]
+
+    # 阶段 2：锁外按旧版参数求解全部受影响草稿；不持锁、不写数据
+    prepared = _solve_recompute(
+        snapshot,
+        history["name"],
+        history["hold_low"],
+        history["hold_high"],
+        history["duration"],
+        history["tolerance"],
+    )
+
+    # 阶段 3：锁内单条事务复核并整体提交；任何漂移都直接 409，不重试
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            affected = _commit_recipe_recompute(
+                conn, recipe_id, prepared, strict=True
+            )
+        recipe = get_recipe(recipe_id)
+        drafts = [get_draft(did) for did in affected]
+    return recipe, drafts
+
+
 def set_recipe_status(recipe_id: int, status: str) -> dict:
     """停用（disabled）/ 恢复（active）配方，只切换状态本身。
 
@@ -302,11 +403,17 @@ def set_recipe_status(recipe_id: int, status: str) -> dict:
         return get_recipe(recipe_id)
 
 
-def _snapshot_recipe_recompute(recipe_id: int) -> dict:
+def _snapshot_recipe_recompute(recipe_id: int, history_version: int | None = None) -> dict:
     """在已持有全局锁时读取修改所需快照（只读，不写任何数据）。
 
     包含：目标配方当前行、所有引用它的活动草稿，以及这些草稿各自引用
     配方的当前行。全部读取自同一连接、同一锁时点，状态彼此自洽。
+
+    history_version 不为 None 时（从历史恢复），同时读取目标历史版本行。
+    恢复入口在调用本函数后才复核「携带的当前版本是否过期」，为保证
+    「配方 404 → 当前已变化 409 → 历史版本不存在 404」的判定先后，
+    目标历史行的缺失检查交由 restore_recipe 显式完成，这里只带回行数据
+    （缺失为 None）。
     """
     with connect() as conn:
         target = conn.execute(
@@ -315,6 +422,15 @@ def _snapshot_recipe_recompute(recipe_id: int) -> dict:
         if target is None:
             raise NotFound(f"配方 {recipe_id} 不存在。")
         target = dict(target)
+
+        history_row = None
+        if history_version is not None:
+            hr = conn.execute(
+                """SELECT * FROM recipe_versions
+                   WHERE recipe_id=? AND version=?""",
+                (recipe_id, history_version),
+            ).fetchone()
+            history_row = dict(hr) if hr is not None else None
 
         drafts = [
             dict(d)
@@ -335,7 +451,12 @@ def _snapshot_recipe_recompute(recipe_id: int) -> dict:
                 list(ref_ids),
             ).fetchall()
         }
-    return {"target": target, "drafts": drafts, "recipes": recipes}
+    snapshot = {"target": target, "drafts": drafts, "recipes": recipes}
+    if history_version is not None:
+        # 缺失（None）的判定交给 restore_recipe，以保证
+        # 「当前版本过期 409」优先于「历史版本不存在 404」
+        snapshot["history"] = history_row
+    return snapshot
 
 
 def _solve_recompute(
@@ -403,14 +524,25 @@ def _solve_recompute(
     }
 
 
-def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict):
+def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict, strict: bool = False):
     """锁内、单条事务内复核漂移并整体提交；返回受影响草稿 ID。
 
     任一复核不过即说明快照后有他次写操作生效（并发修改共享配方、创建引用
-    炉次、归档等），返回 None 让调用方整批作废、刷新快照重算，绝不覆盖
-    他次修改、不漏算新草稿、不触碰已归档冻结方案。复核通过后，配方新参数
-    /版本与全部草稿的新参数快照、结果/原因、版本在同一事务里一起生效。
+    炉次、归档等）：普通整份修改（strict=False）返回 None，让调用方整批
+    作废、刷新快照重算，绝不覆盖他次修改、不漏算新草稿、不触碰已归档冻结
+    方案；从历史恢复（strict=True）**不允许重试**——普通修改先于恢复提交
+    时，即便恢复已完成求解也直接抛 Conflict（409），由调用方放弃本次恢复，
+    绝不重试后覆盖新修改。复核通过后，配方新参数/版本、新追加的参数历史
+    与全部草稿的新参数快照、结果/原因、版本在同一事务里一起生效。
     """
+
+    def drift(current: int | None = None) -> None:
+        if strict:
+            raise Conflict(
+                "配方在恢复求解期间已发生变化，请重新读取历史与当前参数后再恢复。",
+                current,
+            )
+
     target = conn.execute(
         "SELECT * FROM recipes WHERE id=?", (recipe_id,)
     ).fetchone()
@@ -418,7 +550,8 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict):
         # 配方没有删除接口；缺失意味着状态已不可预期，直接回滚
         raise NotFound(f"配方 {recipe_id} 不存在。")
     if target["version"] != prepared["base_version"]:
-        return None  # 配方已被他次修改 / 停用恢复之外的写操作抢先生效
+        drift(target["version"])  # 普通修改重试；恢复：他次修改已先生效，直接 409
+        return None
 
     # 受影响草稿集合必须与快照一致：不多（不能改写已归档/新建外的草稿）、
     # 不少（引用该配方的新草稿必须纳入）
@@ -434,12 +567,14 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict):
     by_id = {d["id"]: d for d in current_active}
     expected_ids = {d["id"] for d in prepared["drafts"]}
     if set(by_id) != expected_ids:
-        return None  # 快照后有草稿被归档，或有引用该配方的新炉次创建
+        drift()  # 快照后有草稿被归档，或有引用该配方的新炉次创建
+        return None
 
     for pd in prepared["drafts"]:
         cur = by_id[pd["id"]]
         if cur["version"] != pd["base_version"]:
-            return None  # 该草稿已被他次修改（其他共享配方的修改）重算
+            drift()  # 该草稿已被他次修改（其他共享配方的修改）重算
+            return None
         # 该草稿引用的每个配方版本都必须与求解快照时一致（目标配方此刻
         # 也尚未 +1）；若有其他共享配方被改过，本批结果必须作废重算
         for rid, snapshot_version in pd["base_ref_versions"].items():
@@ -447,16 +582,27 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict):
                 "SELECT version FROM recipes WHERE id=?", (int(rid),)
             ).fetchone()
             if row is None or row["version"] != snapshot_version:
+                drift()
                 return None
 
     # 复核通过：配方与全部受影响草稿在同一事务内一起生效
     name, hold_low, hold_high, duration, tolerance = prepared["fields"]
+    new_version = prepared["base_version"] + 1
     now = _now()
     conn.execute(
         """UPDATE recipes SET name=?, hold_low=?, hold_high=?, duration=?,
                tolerance=?, version=version+1, updated_at=?
            WHERE id=?""",
         (name, hold_low, hold_high, duration, tolerance, now, recipe_id),
+    )
+    # 每次成功整份修改（含从历史恢复）都追加一条参数历史；停用/恢复不经过
+    # 这里，因此不会记参数历史。历史与配方、草稿同一事务，异常整体回滚。
+    conn.execute(
+        """INSERT INTO recipe_versions
+           (recipe_id, version, name, hold_low, hold_high, duration, tolerance)
+           VALUES (?,?,?,?,?,?,?)""",
+        (recipe_id, new_version, name, hold_low, hold_high,
+         duration, tolerance),
     )
     for pd in prepared["drafts"]:
         conn.execute(

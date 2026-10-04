@@ -115,15 +115,46 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
   上限、至多 200°C 的整十数）。
 - 支持**创建、读取、整份修改**（PUT 为全量替换）。配方创建时版本为 1，
   每次成功修改版本 +1；**非法修改返回 422，不写入任何数据**（配方版本、
-  引用草稿均保持原样）。
+  参数历史、引用草稿均保持原样）。
 - 每个配方带有**状态**：`active`（可用，默认）/ `disabled`（停用）。
   新建配方与旧数据库中已有的配方一律为可用；状态保存在 SQLite 中，
   重启后保留。`GET /api/recipes` 始终列出**全部**配方并附 `status`。
 - **停用 / 恢复**：`POST /api/recipes/{id}/disable`、
   `POST /api/recipes/{id}/enable`（未知配方返回 404；重复停用 / 恢复
   幂等返回 200）。状态切换**不改变材料参数、不增加配方或草稿版本、
-  不重算任何炉次**；停用的配方仍可整份修改（保持停用），原有引用草稿
-  照常重算与归档，已归档方案不受影响。恢复后可再次被新炉次引用。
+  不记参数历史、不重算任何炉次**；停用的配方仍可整份修改（保持停用），
+  原有引用草稿照常重算与归档，已归档方案不受影响。恢复后可再次被新炉次
+  引用。
+
+#### 配方参数历史与旧版恢复
+
+- **回看历史**：`GET /api/recipes/{id}/versions` 按 **version 升序**列出
+  该配方的全部历史版本，每项含 `version`、`name` 与全部材料参数
+  （`holdLow` / `holdHigh` / `duration` / `tolerance`）；配方不存在返回
+  **404**。
+- 历史**只追加**：新配方从版本 1 记起；**每次成功的整份修改（PUT）都追加
+  新版本**；停用与恢复可用状态**不记**参数历史。升级本版本前的旧数据库
+  只对每个配方**补记当前 version**（更早的参数无法追溯），**重复启动不
+  重复补记**；历史随现有 SQLite 卷（`planner-data`）跨重启保留。
+- **恢复旧版**：`POST /api/recipes/{id}/restore`，请求体携带目标历史
+  版本 `version` 与查看历史时看到的当前版本 `currentVersion`。
+  - 当前版本已变化（期间发生过普通修改或恢复）→ **409**，响应体附
+    `currentVersion`，需重新读取后再恢复；
+  - 配方不存在、或目标历史版本不存在 → **404**；
+  - 成功 → **复制旧版的名称与全部材料参数**作为新的当前参数，当前
+    **version +1**（恢复版本 1 也会生成新版本，例如当前 v3 恢复到 v1
+    后变为 v4，v4 参数与 v1 相同）并**追加一条历史**，**保持当前可用
+    状态**（停用中恢复仍为停用）；随后**按普通修改的原规则在同一事务里
+    重算全部活动引用草稿**（版本各 +1、无解清除旧曲线并记录原因），
+    **已归档炉次不改**。响应结构与 PUT 相同（`recipe` +
+    `recomputedDrafts`）。
+- **恢复的事务与并发语义**：与 PUT 一样先锁内取快照、**锁外求解**
+  （求解期间三个 GET 仍立即返回上一整次已提交的完整状态，不等求解），
+  再在**单条事务**里复核并提交——参数历史、配方与草稿**一起提交**，
+  求解或写库异常均回滚、全部不生效。但恢复**只有一次机会、不重试**：
+  若一次**普通修改先于恢复提交**（哪怕恢复已经完成求解），恢复一律返回
+  **409**，**不得重试后覆盖新修改**；求解期间出现引用该配方的新炉次、
+  草稿被归档或其他共享配方被修改，同样 409 失败且不留任何改动。
 
 ### 炉次草稿 `/api/drafts`
 
@@ -260,6 +291,8 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | GET | `/api/recipes` | 列出全部配方（含 `status`：`active` / `disabled`） |
 | POST | `/api/recipes` | 创建配方（201，版本从 1 开始，默认可用） |
 | GET | `/api/recipes/{id}` | 读取单个配方（含状态） |
+| GET | `/api/recipes/{id}/versions` | 按 version 升序列出参数历史（版本、名称与全部材料参数；未知配方 404） |
+| POST | `/api/recipes/{id}/restore` | 携带 `version`（目标历史版）与 `currentVersion`（查看时当前版）恢复旧版：当前已变化 409 / 配方或历史版本不存在 404；原子重算活动引用草稿，不改归档 |
 | PUT | `/api/recipes/{id}` | 整份修改配方；原子重算引用它的活动草稿（版本 +1）；停用配方也可修改并保持停用 |
 | POST | `/api/recipes/{id}/disable` | 停用配方（200；未知 404；不改参数/版本，不重算草稿） |
 | POST | `/api/recipes/{id}/enable` | 恢复配方为可用（200；未知 404） |
@@ -485,6 +518,89 @@ curl -sS -X PUT http://localhost:8000/api/recipes/1 \
 **422 且不改变任何数据**：配方版本不增加，引用草稿也不会被重算。
 新参数导致草稿无解时，草稿仍保存：`version` 增加、`solvable:false`、
 `result:null`、`reason` 为中文原因。
+
+### 回看参数历史并恢复旧版（可直接复制执行）
+
+接着上例（配方 1 已 PUT 过一次，当前 `version:2`，另有一个引用它的炉次
+草稿 1）：
+
+```bash
+# 按 version 升序查看历史：创建 v1 与每次成功整份修改都会列出；
+# 停用 / 恢复可用状态不出现在历史里
+curl -sS http://localhost:8000/api/recipes/1/versions
+```
+
+```json
+[
+  {"version": 1, "name": "钢甲", "holdLow": 60, "holdHigh": 100,
+   "duration": 10, "tolerance": 150},
+  {"version": 2, "name": "钢甲", "holdLow": 70, "holdHigh": 100,
+   "duration": 10, "tolerance": 150}
+]
+```
+
+```bash
+# 恢复为历史 v1：version 填目标历史版本，currentVersion 填查看时的当前版本
+curl -sS -X POST http://localhost:8000/api/recipes/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"currentVersion":2}'
+```
+
+返回（HTTP 200，节选）：恢复复制 v1 的名称与参数，当前版本 +1 变为 **v3**，
+并按原规则重算全部**活动**引用草稿（草稿版本同步 +1），已归档炉次不变；
+配方若正处于停用状态，恢复后**仍保持停用**。
+
+```json
+{
+  "recipe": { "id": 1, "name": "钢甲", "holdLow": 60, "holdHigh": 100,
+              "duration": 10, "tolerance": 150, "status": "active",
+              "version": 3, "...": "..." },
+  "recomputedDrafts": [
+    { "id": 1, "status": "active", "version": 3, "solvable": true,
+      "materials": [ { "holdLow": 60, "...": "..." } ],
+      "result": { "...": "与 materials 同版的完整结果" } }
+  ]
+}
+```
+
+再次查看历史会看到恢复也追加了一条（v3 与 v1 参数相同）：
+
+```bash
+curl -sS http://localhost:8000/api/recipes/1/versions
+# [{"version":1,...,"holdLow":60,...},
+#  {"version":2,...,"holdLow":70,...},
+#  {"version":3,...,"holdLow":60,...}]
+```
+
+冲突与不存在的情况：
+
+```bash
+# 期间配方又被改过（当前已是 v4），仍带 currentVersion=3 恢复 → 409
+curl -sS -i -X POST http://localhost:8000/api/recipes/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"currentVersion":3}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"配方已过期：你查看的是版本 3，当前为版本 4，请重新读取后再恢复。",
+#            "currentVersion":4}}
+
+# 目标历史版本不存在 → 404
+curl -sS -i -X POST http://localhost:8000/api/recipes/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version":99,"currentVersion":4}'
+# HTTP/1.1 404 Not Found
+# {"detail":"配方 1 的历史版本 99 不存在。"}
+
+# 配方不存在 → 404（查看历史与恢复一致）
+curl -sS -i http://localhost:8000/api/recipes/999/versions
+# HTTP/1.1 404 Not Found
+# {"detail":"配方 999 不存在。"}
+```
+
+恢复与普通修改一样在**锁外求解、单事务整体提交**：求解期间 `GET` 三个
+读取接口仍立即返回上一整次已提交状态；历史、配方与草稿一起提交，求解或
+写库异常全部回滚。若一次普通修改**先于恢复提交**，即使恢复已完成求解也
+返回 **409**，服务端**不会重试**，新修改不会被覆盖——重新读取历史与
+`currentVersion` 后再发起恢复即可。
 
 ### 停用配方 → 拒绝引用 → 恢复
 

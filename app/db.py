@@ -88,6 +88,21 @@ CREATE TABLE IF NOT EXISTS archives (
     archived_at     TEXT    NOT NULL,
     FOREIGN KEY (draft_id) REFERENCES drafts(id)
 );
+
+-- 配方参数历史：仅追加。每次成功的整份修改（含从历史恢复）写入一个新版本行；
+-- 创建配方写入版本 1；停用 / 恢复可用状态不写历史。旧库就地补记每个配方的
+-- 当前版本（仅一次，重复启动不重复补记）。随现有 SQLite 卷跨重启保留。
+CREATE TABLE IF NOT EXISTS recipe_versions (
+    recipe_id   INTEGER NOT NULL,
+    version     INTEGER NOT NULL,
+    name        TEXT    NOT NULL DEFAULT '',
+    hold_low    INTEGER NOT NULL,
+    hold_high   INTEGER NOT NULL,
+    duration    INTEGER NOT NULL,
+    tolerance   INTEGER NOT NULL,
+    PRIMARY KEY (recipe_id, version),
+    FOREIGN KEY (recipe_id) REFERENCES recipes(id)
+);
 """
 
 
@@ -98,11 +113,26 @@ def init_db() -> None:
 
 
 def _migrate(conn) -> None:
-    """旧库就地升级：recipes 缺少 status 列时补上，既有配方默认可用。"""
+    """旧库就地升级。
+
+    1. recipes 缺少 status 列时补上，既有配方默认可用；
+    2. recipe_versions 历史表对旧库只补记每个配方的**当前 version**（历史
+       参数无法追溯）；INSERT OR IGNORE + 「已有历史即不补记」双重保证
+       重复启动不会重复补记，此后新创建 / 修改 / 恢复照常只追加。
+    """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
     if "status" not in cols:
         conn.execute(
             "ALTER TABLE recipes ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+
+    existing = conn.execute("SELECT COUNT(*) FROM recipe_versions").fetchone()[0]
+    if existing == 0:
+        conn.execute(
+            """INSERT OR IGNORE INTO recipe_versions
+               (recipe_id, version, name, hold_low, hold_high, duration, tolerance)
+               SELECT id, version, name, hold_low, hold_high, duration, tolerance
+               FROM recipes"""
         )
 
 
